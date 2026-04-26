@@ -37,9 +37,33 @@ scanner scan-once --dry-run
 
 # real run — sends to Telegram
 scanner scan-once
+
+# delta scan over the watchlist (forced fresh OHLCV)
+scanner watchlist-scan
+
+# long-running daemon: 4 full scans/day + hourly watchlist delta
+scanner run
 ```
 
-To run daily, add a cron entry (after the daily UTC close stabilises):
+For the daemon, prefer running under systemd:
+
+```ini
+# /etc/systemd/system/scanner.service
+[Unit]
+Description=Crypto Momentum Scanner
+After=network.target
+
+[Service]
+WorkingDirectory=/path/to/Bot
+ExecStart=/path/to/Bot/.venv/bin/scanner run
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Or as a quick cron alternative for the simple daily mode:
 
 ```cron
 30 0 * * *  cd /path/to/Bot && /path/to/Bot/.venv/bin/scanner scan-once >> /var/log/scanner.log 2>&1
@@ -66,6 +90,12 @@ All thresholds live in `.env` and override the defaults in `scanner/config.py`:
 | `SCANNER_TOP_N` | 15 | Max tokens per digest |
 | `SCANNER_NETWORKS` | solana,eth,base,arbitrum,bsc | DEX chains scanned |
 | `SCANNER_REALERT_COOLDOWN_DAYS` | 5 | Days before re-alerting |
+| `SCANNER_WATCHLIST_THRESHOLD` | 0.45 | Min score to keep a token on the daemon's hourly watchlist |
+| `SCANNER_CHART_TOP_N` | 5 | How many top candidates get a chart PNG attached |
+| `SCANNER_REJECT_WASH_TRADE` | true | Drop tokens whose tx pattern looks washed |
+| `SCANNER_FULL_SCAN_HOURS` | 0,6,12,18 | UTC hours for daemon full scans |
+| `SCANNER_FULL_SCAN_MINUTE` | 30 | Minute-of-hour for full scans |
+| `SCANNER_WATCHLIST_SCAN_MINUTES` | 60 | Watchlist delta scan period |
 
 ## Layout
 
@@ -74,22 +104,24 @@ scanner/
   config.py         pydantic-settings
   sources/
     base.py         Source Protocol + Token model
-    geckoterminal.py  primary DEX universe + OHLCV
+    geckoterminal.py  primary DEX universe + OHLCV + wash-trade signals
     dexscreener.py    enrichment (mcap, age, liquidity)
     coingecko.py    listed cross-source + BTC OHLCV
   universe.py       merge + dedupe + gem filters
   ohlcv.py          parquet cache layer
   indicators.py     MA, RSI, perf, up_days
   scoring.py        composite score + ranking
-  alerts.py         Telegram bot API + digest format
-  state.py          SQLite dedupe
-  main.py           Typer CLI
+  chart.py          mplfinance PNG renderer
+  alerts.py         Telegram bot API (sendMessage + sendPhoto) + digest format
+  state.py          SQLite dedupe + watchlist
+  metrics.py        per-scan stats (counts, errors, durations)
+  main.py           Typer CLI (config-check / scan-once / watchlist-scan / run)
 tests/              fixture-based unit tests
 ```
 
-## Phase 2 ideas
+## Phase 3 ideas (not yet built)
 
-- Long-running asyncio daemon with 4×/day scans + watchlist hourly delta
-- Chart PNG attached via mplfinance
-- Anti wash-trade ratio (unique traders / total trades)
 - Optional Sonnet 4.6 LLM filter (toggle via `SCANNER_LLM_FILTER_ENABLED=true`)
+- Birdeye Solana paid tier for deeper holder/wash data
+- CoinGecko Pro tier to scan top 5000 listed
+- Backtest harness on archived OHLCV to tune weights

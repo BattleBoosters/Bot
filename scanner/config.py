@@ -30,8 +30,14 @@ class Settings(BaseSettings):
     min_vol_24h_usd: float = Field(default=100_000, alias="SCANNER_MIN_VOL_24H_USD")
 
     score_threshold: float = Field(default=0.60, alias="SCANNER_SCORE_THRESHOLD")
+    watchlist_threshold: float = Field(default=0.45, alias="SCANNER_WATCHLIST_THRESHOLD")
     top_n: int = Field(default=15, alias="SCANNER_TOP_N")
+    chart_top_n: int = Field(default=5, alias="SCANNER_CHART_TOP_N")
     realert_cooldown_days: int = Field(default=5, alias="SCANNER_REALERT_COOLDOWN_DAYS")
+    reject_wash_trade: bool = Field(default=True, alias="SCANNER_REJECT_WASH_TRADE")
+    full_scan_hours_csv: str = Field(default="0,6,12,18", alias="SCANNER_FULL_SCAN_HOURS")
+    full_scan_minute: int = Field(default=30, alias="SCANNER_FULL_SCAN_MINUTE")
+    watchlist_scan_minutes: int = Field(default=60, alias="SCANNER_WATCHLIST_SCAN_MINUTES")
 
     networks_csv: str = Field(default="solana,eth,base,arbitrum,bsc", alias="SCANNER_NETWORKS")
 
@@ -45,6 +51,21 @@ class Settings(BaseSettings):
     @property
     def networks(self) -> list[str]:
         return [n.strip().lower() for n in self.networks_csv.split(",") if n.strip()]
+
+    @property
+    def full_scan_hours(self) -> list[int]:
+        out: list[int] = []
+        for s in self.full_scan_hours_csv.split(","):
+            s = s.strip()
+            if not s:
+                continue
+            try:
+                h = int(s)
+            except ValueError:
+                continue
+            if 0 <= h <= 23:
+                out.append(h)
+        return sorted(set(out)) or [0]
 
     def telegram_configured(self) -> bool:
         return bool(self.telegram_bot_token) and bool(self.telegram_chat_id)

@@ -71,13 +71,16 @@ async def fetch_many(
     days: int,
     cache_dir: Path,
     concurrency: int = 4,
+    cache_max_age_hours: float = 6.0,
 ) -> dict[str, pd.DataFrame]:
     sem = asyncio.Semaphore(concurrency)
     out: dict[str, pd.DataFrame] = {}
 
     async def one(tok: Token) -> None:
         async with sem:
-            df = await get_ohlcv_cached(source, tok, days, cache_dir)
+            df = await get_ohlcv_cached(
+                source, tok, days, cache_dir, cache_max_age_hours
+            )
             if not df.empty:
                 out[tok.key] = df
 

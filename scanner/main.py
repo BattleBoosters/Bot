@@ -2,7 +2,11 @@
 
 Commands:
     config-check    Verify .env and ping Telegram.
-    scan-once       Run the pipeline once. Use --dry-run to skip Telegram send.
+    scan-once       Run one full scan (universe → score → alert).
+    watchlist-scan  Run one watchlist delta scan (forced fresh OHLCV, alert
+                    only on tokens crossing the score threshold).
+    run             Long-running daemon: 4 full scans/day plus an hourly
+                    watchlist delta scan.
 """
 
 from __future__ import annotations
@@ -10,15 +14,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import typer
 
-from scanner.alerts import format_digest, ping_telegram, send_message
+from scanner.alerts import (
+    format_card,
+    format_digest,
+    ping_telegram,
+    send_message,
+    send_photo,
+)
+from scanner.chart import render_ohlcv_png
 from scanner.config import Settings, get_settings
+from scanner.metrics import ScanStats
 from scanner.ohlcv import fetch_many, get_ohlcv_cached
 from scanner.scoring import ScoredCandidate, rank_candidates, score_token
-from scanner.sources.base import Token
+from scanner.sources.base import Source, Token
 from scanner.sources.coingecko import CoinGeckoSource
 from scanner.sources.dexscreener import DexscreenerSource
 from scanner.sources.geckoterminal import GeckoTerminalSource
@@ -34,6 +48,13 @@ logging.basicConfig(
 logger = logging.getLogger("scanner")
 
 
+@dataclass
+class Sources:
+    gt: GeckoTerminalSource
+    ds: DexscreenerSource
+    cg: CoinGeckoSource
+
+
 def _make_client(settings: Settings) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         timeout=httpx.Timeout(settings.request_timeout_seconds),
@@ -43,19 +64,34 @@ def _make_client(settings: Settings) -> httpx.AsyncClient:
     )
 
 
-async def _gather_universe(
-    gt: GeckoTerminalSource, cg: CoinGeckoSource
-) -> list[Token]:
-    gt_tokens, cg_tokens = await asyncio.gather(
-        gt.list_universe(),
-        cg.list_universe(),
-        return_exceptions=False,
+def _build_sources(settings: Settings, client: httpx.AsyncClient) -> Sources:
+    return Sources(
+        gt=GeckoTerminalSource(networks=settings.networks, client=client),
+        ds=DexscreenerSource(client=client),
+        cg=CoinGeckoSource(
+            client=client,
+            mcap_min=settings.mcap_min_usd,
+            mcap_max=settings.mcap_max_usd,
+            api_key=settings.coingecko_api_key,
+        ),
     )
+
+
+async def _gather_universe(srcs: Sources, stats: ScanStats) -> list[Token]:
+    async def safe(src: Source) -> list[Token]:
+        try:
+            return await src.list_universe()
+        except Exception as e:
+            logger.warning("%s.list_universe failed: %s", src.name, e)
+            stats.bump_error(src.name)
+            return []
+
+    gt_tokens, cg_tokens = await asyncio.gather(safe(srcs.gt), safe(srcs.cg))
     return list(gt_tokens) + list(cg_tokens)
 
 
 async def _enrich_dexscreener(
-    ds: DexscreenerSource, tokens: list[Token]
+    ds: DexscreenerSource, tokens: list[Token], stats: ScanStats
 ) -> None:
     needs = [
         t for t in tokens
@@ -69,77 +105,167 @@ async def _enrich_dexscreener(
 
     async def one(tok: Token) -> None:
         async with sem:
-            await ds.enrich(tok)
+            try:
+                await ds.enrich(tok)
+            except Exception as e:
+                logger.debug("dexscreener enrich error for %s: %s", tok.symbol, e)
+                stats.bump_error(ds.name)
 
     await asyncio.gather(*(one(t) for t in needs))
 
 
-async def _scan_once(settings: Settings, dry_run: bool) -> int:
-    async with _make_client(settings) as client:
-        gt = GeckoTerminalSource(networks=settings.networks, client=client)
-        ds = DexscreenerSource(client=client)
-        cg = CoinGeckoSource(
-            client=client,
-            mcap_min=settings.mcap_min_usd,
-            mcap_max=settings.mcap_max_usd,
-            api_key=settings.coingecko_api_key,
+async def _score_candidates(
+    candidates: list[Token],
+    srcs: Sources,
+    settings: Settings,
+    stats: ScanStats,
+    force_fresh: bool = False,
+) -> tuple[list[ScoredCandidate], dict, "object"]:
+    chain_toks = [t for t in candidates if t.chain and t.pool_address]
+    listed_toks = [t for t in candidates if t.coingecko_id and not (t.chain and t.pool_address)]
+
+    cache_age = 0.0 if force_fresh else 6.0
+    chain_ohlcv = await fetch_many(
+        srcs.gt, chain_toks, days=30, cache_dir=settings.cache_dir, concurrency=3,
+        cache_max_age_hours=cache_age,
+    )
+    listed_ohlcv = await fetch_many(
+        srcs.cg, listed_toks, days=30, cache_dir=settings.cache_dir, concurrency=2,
+        cache_max_age_hours=cache_age,
+    )
+    ohlcv = {**chain_ohlcv, **listed_ohlcv}
+
+    btc_token = Token(symbol="BTC", coingecko_id="bitcoin", source="coingecko")
+    btc_df = await get_ohlcv_cached(
+        srcs.cg, btc_token, days=30, cache_dir=settings.cache_dir,
+        cache_max_age_hours=cache_age,
+    )
+
+    scored: list[ScoredCandidate] = []
+    for tok in candidates:
+        df = ohlcv.get(tok.key)
+        if df is None or df.empty:
+            stats.ohlcv_misses += 1
+            continue
+        sc = score_token(tok, df, btc_df)
+        scored.append(sc)
+    stats.candidates_scored = len(scored)
+    return scored, ohlcv, btc_df
+
+
+async def _send_alerts(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    fresh: list[ScoredCandidate],
+    ohlcv: dict,
+    digest: str,
+    state: AlertState,
+    dry_run: bool,
+    stats: ScanStats,
+) -> bool:
+    if dry_run:
+        print(digest)
+        return True
+
+    if not settings.telegram_configured():
+        print(digest)
+        logger.warning("telegram not configured; printed digest to stdout instead")
+        return True
+
+    sent = await send_message(
+        client,
+        settings.telegram_bot_token,
+        settings.telegram_chat_id,
+        digest,
+    )
+    if not sent:
+        return False
+
+    chart_count = min(settings.chart_top_n, len(fresh))
+    for c in fresh[:chart_count]:
+        df = ohlcv.get(c.token.key)
+        if df is None or df.empty:
+            continue
+        title = f"{c.token.symbol} — score {c.score:.2f}"
+        png = render_ohlcv_png(df, title)
+        if not png:
+            continue
+        await send_photo(
+            client,
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            png,
+            caption=format_card(c),
+            filename=f"{c.token.symbol}.png",
         )
 
-        logger.info("fetching universes (geckoterminal + coingecko)...")
-        raw = await _gather_universe(gt, cg)
-        logger.info("raw universe: %d entries", len(raw))
+    if fresh:
+        for c in fresh:
+            await state.mark_alerted(c.token.key, c.token.symbol, c.score)
+        stats.alerts_sent = len(fresh)
+    return True
 
-        logger.info("enriching DEX-side tokens via Dexscreener...")
-        await _enrich_dexscreener(ds, raw)
+
+async def run_full_scan(settings: Settings, dry_run: bool = False) -> int:
+    stats = ScanStats()
+    async with _make_client(settings) as client:
+        srcs = _build_sources(settings, client)
+
+        logger.info("[full] fetching universes...")
+        raw = await _gather_universe(srcs, stats)
+        stats.universe_raw = len(raw)
+        logger.info("[full] raw universe: %d entries", len(raw))
+
+        logger.info("[full] enriching DEX-side tokens via Dexscreener...")
+        await _enrich_dexscreener(srcs.ds, raw, stats)
 
         cg_needing_age = [
             t for t in raw if t.source == "coingecko" and t.created_at is None
         ][:50]
         if cg_needing_age:
             logger.info(
-                "fetching genesis_date for %d coingecko tokens", len(cg_needing_age)
+                "[full] fetching genesis_date for %d coingecko tokens",
+                len(cg_needing_age),
             )
-            await cg.fetch_genesis_dates(cg_needing_age)
+            try:
+                await srcs.cg.fetch_genesis_dates(cg_needing_age)
+            except Exception as e:
+                logger.warning("genesis_date enrichment failed: %s", e)
+                stats.bump_error("coingecko")
 
-        candidates, stats = apply_filters(raw, settings)
-        if not candidates:
-            logger.info("no tokens passed gem filters")
+        passed, ustats = apply_filters(raw, settings)
+        stats.universe_deduped = ustats.deduped
+        stats.universe_passed = ustats.passed
+        stats.rejected_mcap = ustats.rejected_mcap
+        stats.rejected_age = ustats.rejected_age
+        stats.rejected_liquidity = ustats.rejected_liquidity
+        stats.rejected_honeypot = ustats.rejected_honeypot
+        stats.rejected_wash = ustats.rejected_wash
+        stats.rejected_missing = ustats.rejected_missing_data
 
-        logger.info("fetching OHLCV for %d candidates...", len(candidates))
-        chain_toks = [t for t in candidates if t.chain and t.pool_address]
-        listed_toks = [t for t in candidates if t.coingecko_id and not (t.chain and t.pool_address)]
-
-        chain_ohlcv = await fetch_many(
-            gt, chain_toks, days=30, cache_dir=settings.cache_dir, concurrency=3
+        logger.info("[full] fetching OHLCV for %d candidates...", len(passed))
+        scored, ohlcv, _btc_df = await _score_candidates(
+            passed, srcs, settings, stats, force_fresh=False
         )
-        listed_ohlcv = await fetch_many(
-            cg, listed_toks, days=30, cache_dir=settings.cache_dir, concurrency=2
-        )
-        ohlcv = {**chain_ohlcv, **listed_ohlcv}
 
-        btc_token = Token(
-            symbol="BTC", coingecko_id="bitcoin", source="coingecko"
-        )
-        btc_df = await get_ohlcv_cached(cg, btc_token, days=30, cache_dir=settings.cache_dir)
-
-        scored: list[ScoredCandidate] = []
-        for tok in candidates:
-            df = ohlcv.get(tok.key)
-            if df is None or df.empty:
-                continue
-            sc = score_token(tok, df, btc_df)
-            scored.append(sc)
-
+        qualified = [
+            s for s in scored if s.rejection is None and s.score >= settings.score_threshold
+        ]
+        stats.candidates_qualified = len(qualified)
         ranked = rank_candidates(scored, settings.score_threshold, settings.top_n)
-        logger.info(
-            "scored=%d  qualified=%d  top=%d",
-            len(scored),
-            sum(1 for s in scored if s.rejection is None and s.score >= settings.score_threshold),
-            len(ranked),
-        )
 
         state = AlertState(settings.db_path)
         await state.init()
+
+        # Refresh watchlist with all tokens scoring above the watchlist threshold,
+        # whether or not they made the alert cut.
+        for s in scored:
+            if s.rejection is None and s.score >= settings.watchlist_threshold:
+                await state.upsert_watchlist(s.token, s.score)
+        await state.prune_watchlist(max_age_hours=48)
+        wl = await state.load_watchlist()
+        stats.watchlist_size = len(wl)
+
         fresh: list[ScoredCandidate] = []
         for c in ranked:
             ok = await state.should_alert(
@@ -152,30 +278,126 @@ async def _scan_once(settings: Settings, dry_run: bool) -> int:
 
         digest = format_digest(
             fresh,
-            universe_size=stats.deduped,
-            candidates_total=len([s for s in scored if s.rejection is None and s.score >= settings.score_threshold]),
+            universe_size=ustats.deduped,
+            candidates_total=len(qualified),
             top_n=settings.top_n,
         )
 
-        if dry_run:
-            print(digest)
-            return 0
-
-        if not settings.telegram_configured():
-            print(digest)
-            logger.warning("telegram not configured; printed digest to stdout instead")
-            return 0
-
-        sent = await send_message(
-            client,
-            settings.telegram_bot_token,
-            settings.telegram_chat_id,
-            digest,
+        ok = await _send_alerts(
+            client, settings, fresh, ohlcv, digest, state, dry_run, stats
         )
-        if sent and fresh:
-            for c in fresh:
-                await state.mark_alerted(c.token.key, c.token.symbol, c.score)
-        return 0 if sent else 2
+
+    logger.info("[full] %s", stats.finish().summary_line())
+    return 0 if ok else 2
+
+
+async def run_watchlist_scan(settings: Settings, dry_run: bool = False) -> int:
+    stats = ScanStats()
+    async with _make_client(settings) as client:
+        srcs = _build_sources(settings, client)
+        state = AlertState(settings.db_path)
+        await state.init()
+
+        watchlist = await state.load_watchlist()
+        stats.watchlist_size = len(watchlist)
+        if not watchlist:
+            logger.info("[wl] watchlist empty, nothing to do")
+            return 0
+
+        logger.info("[wl] re-scoring %d watchlist tokens (forced fresh OHLCV)", len(watchlist))
+        scored, ohlcv, _ = await _score_candidates(
+            watchlist, srcs, settings, stats, force_fresh=True
+        )
+        stats.universe_raw = len(watchlist)
+        stats.universe_deduped = len(watchlist)
+        stats.universe_passed = len(watchlist)
+
+        qualified = [
+            s for s in scored if s.rejection is None and s.score >= settings.score_threshold
+        ]
+        stats.candidates_qualified = len(qualified)
+        ranked = rank_candidates(scored, settings.score_threshold, settings.top_n)
+
+        fresh: list[ScoredCandidate] = []
+        for c in ranked:
+            ok = await state.should_alert(
+                c.token.key,
+                c.score,
+                cooldown_days=settings.realert_cooldown_days,
+            )
+            if ok:
+                fresh.append(c)
+
+        if not fresh:
+            logger.info("[wl] no watchlist tokens cleared the alert threshold")
+            logger.info("[wl] %s", stats.finish().summary_line())
+            return 0
+
+        digest = "🔔 Watchlist delta — " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        digest += f"\n{len(fresh)} token(s) viennent de passer le seuil:\n\n"
+        digest += format_digest(
+            fresh,
+            universe_size=len(watchlist),
+            candidates_total=len(qualified),
+            top_n=settings.top_n,
+        )
+
+        ok = await _send_alerts(
+            client, settings, fresh, ohlcv, digest, state, dry_run, stats
+        )
+
+    logger.info("[wl] %s", stats.finish().summary_line())
+    return 0 if ok else 2
+
+
+def _next_full_scan(now: datetime, hours: list[int], minute: int) -> datetime:
+    today = now.replace(minute=minute, second=0, microsecond=0)
+    candidates = [today.replace(hour=h) for h in hours]
+    future = [c for c in candidates if c > now]
+    if future:
+        return min(future)
+    tomorrow = today + timedelta(days=1)
+    return tomorrow.replace(hour=hours[0])
+
+
+def _next_watchlist_scan(now: datetime, every_minutes: int) -> datetime:
+    base = now.replace(second=0, microsecond=0)
+    delta = timedelta(minutes=every_minutes)
+    return base + delta
+
+
+async def run_daemon(settings: Settings) -> int:
+    logger.info(
+        "starting daemon: full scans at %s:%02d UTC, watchlist every %d min",
+        settings.full_scan_hours, settings.full_scan_minute,
+        settings.watchlist_scan_minutes,
+    )
+    next_wl = _next_watchlist_scan(datetime.now(timezone.utc), settings.watchlist_scan_minutes)
+    while True:
+        now = datetime.now(timezone.utc)
+        next_full = _next_full_scan(now, settings.full_scan_hours, settings.full_scan_minute)
+        if next_wl <= now:
+            next_wl = _next_watchlist_scan(now, settings.watchlist_scan_minutes)
+        next_run = min(next_full, next_wl)
+        wait = max(0.0, (next_run - now).total_seconds())
+        logger.info("daemon sleeping %.0fs until %s", wait, next_run.isoformat())
+        try:
+            await asyncio.sleep(wait)
+        except asyncio.CancelledError:
+            logger.info("daemon cancelled")
+            return 0
+
+        try:
+            if next_run == next_full:
+                await run_full_scan(settings, dry_run=False)
+            else:
+                await run_watchlist_scan(settings, dry_run=False)
+                next_wl = _next_watchlist_scan(
+                    datetime.now(timezone.utc), settings.watchlist_scan_minutes
+                )
+        except Exception as e:
+            logger.exception("scan failed: %s", e)
+            await asyncio.sleep(30)
 
 
 async def _config_check(settings: Settings) -> int:
@@ -184,9 +406,12 @@ async def _config_check(settings: Settings) -> int:
     print(f"min age:       {settings.min_age_days} days")
     print(f"vol/mcap min:  {settings.min_vol_mcap_ratio:.2%}")
     print(f"vol24h min:    ${settings.min_vol_24h_usd:,.0f}")
-    print(f"score thresh:  {settings.score_threshold}")
-    print(f"top N:         {settings.top_n}")
+    print(f"score thresh:  {settings.score_threshold}  (watchlist {settings.watchlist_threshold})")
+    print(f"top N:         {settings.top_n}  (charts: top {settings.chart_top_n})")
+    print(f"reject wash:   {settings.reject_wash_trade}")
     print(f"networks:      {settings.networks}")
+    print(f"full scans:    {settings.full_scan_hours} at :{settings.full_scan_minute:02d} UTC")
+    print(f"watchlist:     every {settings.watchlist_scan_minutes} min")
     print(f"cache dir:     {settings.cache_dir}")
     print(f"db path:       {settings.db_path}")
     print(f"telegram cfg:  {settings.telegram_configured()}")
@@ -218,10 +443,36 @@ def scan_once_cmd(
         False, "--dry-run", help="Print digest to stdout instead of Telegram."
     ),
 ) -> None:
-    """Run the full scan pipeline once."""
+    """Run one full scan."""
     settings = get_settings()
     try:
-        code = asyncio.run(_scan_once(settings, dry_run))
+        code = asyncio.run(run_full_scan(settings, dry_run))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    raise typer.Exit(code)
+
+
+@app.command("watchlist-scan")
+def watchlist_scan_cmd(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print digest to stdout instead of Telegram."
+    ),
+) -> None:
+    """Run one watchlist delta scan (forced fresh OHLCV)."""
+    settings = get_settings()
+    try:
+        code = asyncio.run(run_watchlist_scan(settings, dry_run))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    raise typer.Exit(code)
+
+
+@app.command("run")
+def run_cmd() -> None:
+    """Run as a long-lived daemon: full scans 4×/day plus hourly watchlist."""
+    settings = get_settings()
+    try:
+        code = asyncio.run(run_daemon(settings))
     except KeyboardInterrupt:
         sys.exit(130)
     raise typer.Exit(code)

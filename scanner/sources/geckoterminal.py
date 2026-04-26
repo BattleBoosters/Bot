@@ -45,6 +45,40 @@ def _safe_float(v: Any) -> float | None:
     return f
 
 
+def _wash_signal(
+    buys: Any, sells: Any, buyers: Any, sellers: Any
+) -> dict:
+    """Heuristic wash-trade flags from h24 transaction counts.
+
+    - unique_traders / total_tx ratio: low = lots of repeat traders
+      (wash signature).
+    - buy/sell skew: extreme imbalance can indicate one-sided manipulation.
+
+    Returns flag fields merged into Token.extra.
+    """
+    out: dict = {}
+    try:
+        b = int(buys or 0)
+        s = int(sells or 0)
+        br = int(buyers or 0)
+        sr = int(sellers or 0)
+    except (TypeError, ValueError):
+        return out
+    total_tx = b + s
+    unique = br + sr
+    if total_tx >= 30 and unique > 0:
+        ratio = unique / total_tx
+        out["unique_trader_ratio"] = round(ratio, 3)
+        if ratio < 0.20:
+            out["wash_trade_warning"] = True
+    if total_tx >= 50:
+        skew = abs(b - s) / total_tx
+        out["buy_sell_skew"] = round(skew, 3)
+        if skew > 0.85:
+            out["one_sided_warning"] = True
+    return out
+
+
 def _parse_dt(v: Any) -> datetime | None:
     if not v:
         return None
@@ -159,6 +193,21 @@ class GeckoTerminalSource:
         if pool_addr:
             chart_url = f"https://www.geckoterminal.com/{network}/pools/{pool_addr}"
 
+        extra: dict = {}
+        tx_h24 = (attrs.get("transactions") or {}).get("h24") or {}
+        buys = tx_h24.get("buys")
+        sells = tx_h24.get("sells")
+        buyers = tx_h24.get("buyers")
+        sellers = tx_h24.get("sellers")
+        if any(v is not None for v in (buys, sells, buyers, sellers)):
+            extra["tx_h24"] = {
+                "buys": buys,
+                "sells": sells,
+                "buyers": buyers,
+                "sellers": sellers,
+            }
+            extra.update(_wash_signal(buys, sells, buyers, sellers))
+
         return Token(
             symbol=symbol,
             name=b.get("name") or symbol,
@@ -171,6 +220,7 @@ class GeckoTerminalSource:
             source=self.name,
             pool_address=pool_addr,
             chart_url=chart_url,
+            extra=extra,
         )
 
     async def get_ohlcv(self, token: Token, days: int) -> pd.DataFrame:

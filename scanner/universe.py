@@ -24,6 +24,7 @@ class FilterStats:
     rejected_age: int = 0
     rejected_liquidity: int = 0
     rejected_honeypot: int = 0
+    rejected_wash: int = 0
     rejected_missing_data: int = 0
 
 
@@ -98,6 +99,8 @@ def is_gem_candidate(token: Token, settings: Settings) -> tuple[bool, str]:
         return False, "liquidity"
     if token.suspected_honeypot:
         return False, "honeypot"
+    if token.extra.get("wash_trade_warning") and settings.reject_wash_trade:
+        return False, "wash"
     return True, "ok"
 
 
@@ -121,14 +124,16 @@ def apply_filters(
             stats.rejected_liquidity += 1
         elif reason == "honeypot":
             stats.rejected_honeypot += 1
+        elif reason == "wash":
+            stats.rejected_wash += 1
         else:
             stats.rejected_missing_data += 1
     stats.passed = len(passed)
     logger.info(
         "universe filter: raw=%d deduped=%d passed=%d "
-        "rej_mcap=%d rej_age=%d rej_liq=%d rej_honey=%d rej_missing=%d",
+        "rej_mcap=%d rej_age=%d rej_liq=%d rej_honey=%d rej_wash=%d rej_missing=%d",
         stats.raw_total, stats.deduped, stats.passed,
         stats.rejected_mcap, stats.rejected_age, stats.rejected_liquidity,
-        stats.rejected_honeypot, stats.rejected_missing_data,
+        stats.rejected_honeypot, stats.rejected_wash, stats.rejected_missing_data,
     )
     return passed, stats

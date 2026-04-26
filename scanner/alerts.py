@@ -49,6 +49,49 @@ def _md_escape(text: str) -> str:
     return text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
 
 
+def format_card(c: ScoredCandidate) -> str:
+    """Compact per-candidate summary for a chart caption (≤1000 chars)."""
+    t = c.token
+    chain = t.chain.upper() if t.chain else "CG"
+    venue = (
+        f"{chain} DEX"
+        if t.chain
+        else (f"CG: {t.coingecko_id}" if t.coingecko_id else "Listed")
+    )
+    m = c.metrics
+    rsi_v = m.get("rsi_14")
+    rs_btc = (
+        (m.get("perf_7d") or 0.0) - (m.get("btc_perf_7d") or 0.0)
+        if m.get("perf_7d") is not None and m.get("btc_perf_7d") is not None
+        else None
+    )
+    ud = m.get("up_days_7")
+    accel = c.factors.get("acceleration", 0.0)
+    flag_bits = []
+    if t.suspected_honeypot:
+        flag_bits.append("⚠ honeypot")
+    if t.extra.get("wash_trade_warning"):
+        flag_bits.append("⚠ wash?")
+    flags = (" " + " ".join(flag_bits)) if flag_bits else ""
+    lines = [
+        f"💎 {t.symbol} ({venue}, age {_fmt_age(t.age_days)}) — score {c.score:.2f}{flags}",
+        f"mcap {_fmt_money(t.mcap_usd)}  vol24h {_fmt_money(t.vol_24h_usd)}  vol/mcap {_fmt_pct(t.vol_mcap_ratio)}",
+        f"3j {_fmt_pct(m.get('perf_3d'))}  7j {_fmt_pct(m.get('perf_7d'))}  14j {_fmt_pct(m.get('perf_14d'))}  accel {accel:.2f}",
+    ]
+    bits = []
+    if rsi_v is not None:
+        bits.append(f"RSI {rsi_v:.0f}")
+    if rs_btc is not None:
+        bits.append(f"vs BTC {_fmt_pct(rs_btc)}")
+    if ud is not None:
+        bits.append(f"up {ud}/7")
+    if bits:
+        lines.append("  ".join(bits))
+    if t.chart_url:
+        lines.append(t.chart_url)
+    return "\n".join(lines)
+
+
 def format_digest(
     candidates: list[ScoredCandidate],
     universe_size: int,
@@ -134,6 +177,31 @@ async def send_message(
             logger.error("telegram send failed: %s", e)
             return False
     return True
+
+
+async def send_photo(
+    client: httpx.AsyncClient,
+    bot_token: str,
+    chat_id: str,
+    image: bytes,
+    caption: str = "",
+    filename: str = "chart.png",
+) -> bool:
+    if not bot_token or not chat_id or not image:
+        return False
+    url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    # Telegram caption hard limit is 1024 chars.
+    if len(caption) > 1000:
+        caption = caption[:1000] + "…"
+    files = {"photo": (filename, image, "image/png")}
+    data = {"chat_id": chat_id, "caption": caption}
+    try:
+        r = await client.post(url, data=data, files=files, timeout=60.0)
+        r.raise_for_status()
+        return True
+    except httpx.HTTPError as e:
+        logger.error("telegram sendPhoto failed: %s", e)
+        return False
 
 
 async def ping_telegram(
