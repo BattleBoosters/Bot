@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -46,6 +46,19 @@ CREATE TABLE IF NOT EXISTS watchlist (
     snapshot_json   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_watchlist_seen ON watchlist(last_seen_ts);
+
+CREATE TABLE IF NOT EXISTS holder_snapshots (
+    token_key       TEXT NOT NULL,
+    ts              TEXT NOT NULL,
+    holder_count    INTEGER,
+    top10_share     REAL,
+    top20_share     REAL,
+    tvl_usd         REAL,
+    buyers_h24      INTEGER,
+    sellers_h24     INTEGER,
+    PRIMARY KEY (token_key, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_holder_ts ON holder_snapshots(token_key, ts);
 """
 
 
@@ -166,6 +179,71 @@ class AlertState:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 "DELETE FROM watchlist WHERE last_seen_ts < ?", (cutoff_iso,)
+            )
+            await db.commit()
+            return cur.rowcount or 0
+
+
+    async def record_holder_snapshot(
+        self,
+        token_key: str,
+        *,
+        holder_count: int | None = None,
+        top10_share: float | None = None,
+        top20_share: float | None = None,
+        tvl_usd: float | None = None,
+        buyers_h24: int | None = None,
+        sellers_h24: int | None = None,
+    ) -> None:
+        """Append a snapshot row keyed by (token, ts). Used to compute
+        growth rates over time on subsequent runs."""
+        ts = datetime.now(tz=timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO holder_snapshots(
+                    token_key, ts, holder_count, top10_share, top20_share,
+                    tvl_usd, buyers_h24, sellers_h24
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token_key, ts, holder_count, top10_share, top20_share,
+                    tvl_usd, buyers_h24, sellers_h24,
+                ),
+            )
+            await db.commit()
+
+    async def load_holder_snapshots(
+        self, token_key: str, max_age_days: int = 90
+    ) -> list[dict]:
+        """Return all snapshots for `token_key` not older than `max_age_days`,
+        sorted ascending by ts. Each row is a plain dict for easy use in
+        the scoring layer."""
+        cutoff = (
+            datetime.now(tz=timezone.utc) - timedelta(days=max_age_days)
+        ).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT ts, holder_count, top10_share, top20_share, tvl_usd,
+                       buyers_h24, sellers_h24
+                FROM holder_snapshots
+                WHERE token_key = ? AND ts >= ?
+                ORDER BY ts ASC
+                """,
+                (token_key, cutoff),
+            )
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def prune_holder_snapshots(self, max_age_days: int = 180) -> int:
+        cutoff = (
+            datetime.now(tz=timezone.utc) - timedelta(days=max_age_days)
+        ).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "DELETE FROM holder_snapshots WHERE ts < ?", (cutoff,)
             )
             await db.commit()
             return cur.rowcount or 0

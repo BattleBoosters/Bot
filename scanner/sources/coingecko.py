@@ -100,8 +100,10 @@ class CoinGeckoSource:
 
     async def list_universe(self) -> list[Token]:
         tokens: list[Token] = []
-        # Walk pages ascending by mcap until we exceed mcap_max.
-        for page in range(1, 21):
+        # Walk pages ascending by mcap until we exceed mcap_max. Cap at 40
+        # pages (10k tokens) to keep one full scan within ~2 minutes on the
+        # free tier even when mcap_max is bumped to $300M+.
+        for page in range(1, 41):
             try:
                 rows = await self._get(
                     "/coins/markets",

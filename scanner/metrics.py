@@ -30,6 +30,10 @@ class ScanStats:
     ohlcv_misses: int = 0
     watchlist_size: int = 0
 
+    accumulation_scored: int = 0
+    accumulation_qualified: int = 0
+    accumulation_alerts: int = 0
+
     def finish(self) -> Self:
         self.finished_at = perf_counter()
         return self
@@ -44,6 +48,8 @@ class ScanStats:
             f"raw={self.universe_raw} deduped={self.universe_deduped} "
             f"passed={self.universe_passed} scored={self.candidates_scored} "
             f"qualified={self.candidates_qualified} alerts={self.alerts_sent} | "
+            f"acc scored={self.accumulation_scored} qual={self.accumulation_qualified} "
+            f"alerts={self.accumulation_alerts} | "
             f"rej mcap={self.rejected_mcap} age={self.rejected_age} "
             f"liq={self.rejected_liquidity} honey={self.rejected_honeypot} "
             f"wash={self.rejected_wash} missing={self.rejected_missing} | "

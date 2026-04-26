@@ -21,7 +21,13 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import typer
 
+from scanner.accumulation import (
+    AccumulationCandidate,
+    rank_accumulation,
+    score_accumulation,
+)
 from scanner.alerts import (
+    build_accumulation_digest,
     build_csv,
     format_card,
     format_digest,
@@ -30,6 +36,7 @@ from scanner.alerts import (
     send_message,
     send_photo,
 )
+from scanner.onchain.helius import HeliusClient, concentration_share
 from scanner.chart import render_ohlcv_png
 from scanner.config import Settings, get_settings
 from scanner.metrics import ScanStats
@@ -56,6 +63,7 @@ class Sources:
     gt: GeckoTerminalSource
     ds: DexscreenerSource
     cg: CoinGeckoSource
+    helius: HeliusClient
 
 
 def _make_client(settings: Settings) -> httpx.AsyncClient:
@@ -77,7 +85,98 @@ def _build_sources(settings: Settings, client: httpx.AsyncClient) -> Sources:
             mcap_max=settings.mcap_max_usd,
             api_key=settings.coingecko_api_key,
         ),
+        helius=HeliusClient(client=client, api_key=settings.helius_api_key),
     )
+
+
+async def _snapshot_onchain(
+    tokens: list[Token],
+    helius: HeliusClient,
+    state: AlertState,
+    settings: Settings,
+    stats: ScanStats,
+) -> dict[str, dict]:
+    """Snapshot on-chain accumulation signals for Solana SPL tokens.
+
+    Skips tokens with no Solana address and tokens beyond the
+    `onchain_max_tokens` budget (we cap to keep one scan within Helius's
+    free-tier rate limit). Returns a {token_key: latest_snapshot} dict
+    for the scoring stage.
+    """
+    out: dict[str, dict] = {}
+    if not settings.accumulation_enabled:
+        return out
+
+    sol = [
+        t for t in tokens
+        if t.chain == "solana" and t.address and not t.address.startswith("0x")
+    ][: settings.onchain_max_tokens]
+    if not sol:
+        return out
+
+    sem = asyncio.Semaphore(settings.onchain_concurrency)
+
+    async def one(tok: Token) -> None:
+        async with sem:
+            try:
+                top = await helius.get_top_holders(tok.address)
+                supply = await helius.get_token_supply(tok.address)
+            except Exception as e:
+                logger.debug("onchain snapshot failed for %s: %s", tok.symbol, e)
+                stats.bump_error("helius")
+                return
+            top10 = concentration_share(top, supply, 10)
+            top20 = concentration_share(top, supply, 20)
+
+            holder_count: int | None = None
+            if helius.configured:
+                try:
+                    holder_count = await helius.get_holder_count(tok.address)
+                except Exception as e:
+                    logger.debug("get_holder_count failed for %s: %s", tok.symbol, e)
+                    stats.bump_error("helius")
+
+            tx = (tok.extra or {}).get("tx_h24") or {}
+            await state.record_holder_snapshot(
+                tok.key,
+                holder_count=holder_count,
+                top10_share=top10,
+                top20_share=top20,
+                tvl_usd=tok.vol_24h_usd,  # GT exposes liquidity_usd via extra; fallback
+                buyers_h24=tx.get("buyers"),
+                sellers_h24=tx.get("sellers"),
+            )
+            out[tok.key] = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "holder_count": holder_count,
+                "top10_share": top10,
+                "top20_share": top20,
+                "tvl_usd": tok.vol_24h_usd,
+                "buyers_h24": tx.get("buyers"),
+                "sellers_h24": tx.get("sellers"),
+            }
+
+    await asyncio.gather(*(one(t) for t in sol))
+    return out
+
+
+async def _score_accumulation_layer(
+    candidates: list[Token],
+    ohlcv: dict,
+    state: AlertState,
+    settings: Settings,
+) -> list[AccumulationCandidate]:
+    """Run the accumulation scorer over every universe candidate using the
+    OHLCV we already fetched plus any historical snapshot rows."""
+    if not settings.accumulation_enabled:
+        return []
+    out: list[AccumulationCandidate] = []
+    for tok in candidates:
+        df = ohlcv.get(tok.key)
+        snaps = await state.load_holder_snapshots(tok.key, max_age_days=90)
+        sc = score_accumulation(tok, df, snaps)
+        out.append(sc)
+    return out
 
 
 async def _gather_universe(srcs: Sources, stats: ScanStats) -> list[Token]:
@@ -222,6 +321,76 @@ async def _send_alerts(
     return True
 
 
+async def _send_accumulation(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    candidates: list[AccumulationCandidate],
+    ohlcv: dict,
+    digest: str,
+    dry_run: bool,
+    stats: ScanStats,
+    csv_filename: str = "accumulation.csv",
+) -> bool:
+    if dry_run:
+        print("\n--- ACCUMULATION ---")
+        print(digest)
+        if candidates:
+            print(f"\n[acc csv would be attached: {len(candidates)} rows]")
+        return True
+
+    if not settings.telegram_configured():
+        print("\n--- ACCUMULATION ---")
+        print(digest)
+        return True
+
+    from scanner.alerts import build_accumulation_csv
+
+    sent = await send_message(
+        client,
+        settings.telegram_bot_token,
+        settings.telegram_chat_id,
+        digest,
+    )
+    if not sent:
+        return False
+
+    chart_count = min(settings.chart_top_n, len(candidates))
+    for c in candidates[:chart_count]:
+        df = ohlcv.get(c.token.key)
+        if df is None or df.empty:
+            continue
+        title = f"{c.token.symbol} — accumulation {c.score:.2f}"
+        png = render_ohlcv_png(df, title)
+        if not png:
+            continue
+        caption = (
+            f"🕵️ {c.token.symbol} acc {c.score:.2f}  "
+            f"wyckoff {c.factors.get('wyckoff', 0):.2f}  "
+            f"holders {c.factors.get('holder_growth', 0):.2f}  "
+            f"distrib {c.factors.get('distribution', 0):.2f}"
+        )
+        await send_photo(
+            client,
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            png,
+            caption=caption,
+            filename=f"{c.token.symbol}_acc.png",
+        )
+
+    if candidates:
+        await send_document(
+            client,
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            build_accumulation_csv(candidates),
+            filename=csv_filename,
+            caption=f"{len(candidates)} candidats accumulation triés par score.",
+        )
+        stats.accumulation_alerts = len(candidates)
+    return True
+
+
 async def run_full_scan(settings: Settings, dry_run: bool = False) -> int:
     stats = ScanStats()
     async with _make_client(settings) as client:
@@ -298,6 +467,7 @@ async def run_full_scan(settings: Settings, dry_run: bool = False) -> int:
             universe_size=ustats.deduped,
             candidates_total=len(qualified),
             highlight_top_n=settings.highlight_top_n,
+            mcap_window_str=settings.mcap_window_str,
         )
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
@@ -305,6 +475,33 @@ async def run_full_scan(settings: Settings, dry_run: bool = False) -> int:
             client, settings, fresh, ohlcv, digest, state, dry_run, stats,
             csv_filename=f"gems_{ts}.csv",
         )
+
+        # ----- Accumulation layer (pro-elite) -----
+        if settings.accumulation_enabled:
+            logger.info("[full] taking on-chain accumulation snapshots...")
+            await _snapshot_onchain(passed, srcs.helius, state, settings, stats)
+            await state.prune_holder_snapshots(max_age_days=180)
+
+            logger.info("[full] scoring accumulation layer...")
+            acc_scored = await _score_accumulation_layer(
+                passed, ohlcv, state, settings
+            )
+            acc_ranked = rank_accumulation(
+                acc_scored, settings.accumulation_threshold, top_n=None
+            )
+            stats.accumulation_scored = len(acc_scored)
+            stats.accumulation_qualified = len(acc_ranked)
+
+            if acc_ranked:
+                acc_digest = build_accumulation_digest(
+                    acc_ranked,
+                    universe_size=ustats.deduped,
+                    highlight_top_n=settings.highlight_top_n,
+                )
+                await _send_accumulation(
+                    client, settings, acc_ranked, ohlcv, acc_digest, dry_run, stats,
+                    csv_filename=f"accumulation_{ts}.csv",
+                )
 
     logger.info("[full] %s", stats.finish().summary_line())
     return 0 if ok else 2
@@ -430,6 +627,9 @@ async def _config_check(settings: Settings) -> int:
     print(f"score thresh:  {settings.score_threshold}  (watchlist {settings.watchlist_threshold})")
     print(f"highlights:    top {settings.highlight_top_n}  (charts: top {settings.chart_top_n})")
     print(f"OHLCV window:  {settings.ohlcv_days} days")
+    print(f"accumulation:  {'on' if settings.accumulation_enabled else 'off'}  "
+          f"thresh {settings.accumulation_threshold}  "
+          f"(helius={'configured' if settings.helius_api_key else 'public RPC'})")
     print(f"reject wash:   {settings.reject_wash_trade}")
     print(f"networks:      {settings.networks}")
     print(f"full scans:    {settings.full_scan_hours} at :{settings.full_scan_minute:02d} UTC")

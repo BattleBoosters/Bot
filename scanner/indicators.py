@@ -146,6 +146,92 @@ def weeks_up_ratio(close: pd.Series, n_weeks: int = 12) -> float | None:
     return float((diffs > 0).sum() / n_weeks)
 
 
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> float | None:
+    """Average True Range (Wilder). Daily-bar ATR over `window` bars."""
+    if len(close) < window + 1:
+        return None
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).dropna()
+    if len(tr) < window:
+        return None
+    val = tr.ewm(alpha=1 / window, adjust=False).mean().iloc[-1]
+    if pd.isna(val) or val <= 0:
+        return None
+    return float(val)
+
+
+def wyckoff_compression(ohlcv: pd.DataFrame, recent: int = 20, baseline: int = 90) -> float | None:
+    """Range tightening + volume rising = Wyckoff accumulation signature.
+
+    Returns a 0-1 score:
+      - Volatility ratio: ATR(recent) / ATR(baseline) — lower means range
+        is tightening (compression).
+      - Volume ratio: median volume(recent) / median volume(baseline) —
+        higher means capital is entering despite tight range.
+
+    A pure compression with volume holding/rising scores high. Random walk
+    or expanding range scores low.
+    """
+    if len(ohlcv) < baseline + 5:
+        return None
+    if not {"high", "low", "close", "volume"}.issubset(ohlcv.columns):
+        return None
+    close = ohlcv["close"].astype(float)
+    high = ohlcv["high"].astype(float)
+    low = ohlcv["low"].astype(float)
+    volume = ohlcv["volume"].astype(float)
+
+    atr_r = atr(high.tail(recent + 1), low.tail(recent + 1), close.tail(recent + 1), recent)
+    atr_b = atr(high.tail(baseline + 1), low.tail(baseline + 1), close.tail(baseline + 1), baseline)
+    if atr_r is None or atr_b is None or atr_b <= 0:
+        return None
+
+    last = float(close.iloc[-1])
+    if last <= 0:
+        return None
+    # Normalise to % of price so tokens at any scale compare.
+    atr_r_pct = atr_r / last
+    atr_b_pct = atr_b / last
+    if atr_b_pct <= 0:
+        return None
+    vol_ratio = atr_r_pct / atr_b_pct  # < 1 = compression, > 1 = expansion
+
+    med_v_r = median_volume(volume, recent)
+    med_v_b = median_volume(volume, baseline)
+    if med_v_r is None or med_v_b is None or med_v_b <= 0:
+        return None
+    vol_growth = med_v_r / med_v_b  # > 1 = volume rising
+
+    # Compression component: 0.5 ratio → 1.0, 1.0 → 0.0, capped.
+    compression = clip01((1.0 - vol_ratio) / 0.5)
+    # Volume component: 0.8 → 0, 1.5 → 1.
+    vol_score = clip01((vol_growth - 0.8) / 0.7)
+    return float(0.6 * compression + 0.4 * vol_score)
+
+
+def holder_growth_rate(snapshots: list[tuple[pd.Timestamp, int]], days: int = 14) -> float | None:
+    """% growth in holder count between the oldest snapshot ≤ `days` ago and now.
+
+    `snapshots` is a list of (timestamp, holder_count) sorted ascending.
+    Returns None if we don't yet have a snapshot at least `days` days old.
+    """
+    if not snapshots or len(snapshots) < 2:
+        return None
+    now_ts = snapshots[-1][0]
+    cutoff = now_ts - pd.Timedelta(days=days)
+    older = [(t, c) for (t, c) in snapshots if t <= cutoff]
+    if not older:
+        return None
+    base_count = older[-1][1]
+    last_count = snapshots[-1][1]
+    if base_count <= 0:
+        return None
+    return float(last_count / base_count - 1.0)
+
+
 def clip01(x: float) -> float:
     if x != x:  # NaN
         return 0.0

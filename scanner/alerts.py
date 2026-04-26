@@ -125,15 +125,19 @@ def format_digest(
     universe_size: int,
     candidates_total: int,
     highlight_top_n: int = 10,
+    mcap_window_str: str = "",
 ) -> str:
     """Header message: summary line + detailed top-N highlights.
 
-    Full list goes out as a CSV attachment, see `build_csv`.
+    Full list goes out as a CSV attachment, see `build_csv`. The mcap
+    window string is rendered into the summary line so the digest reflects
+    the actual run config rather than a hard-coded range.
     """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    window_label = f" {mcap_window_str}" if mcap_window_str else ""
     header = (
         f"💎 Gems uptrend scan — {now}\n"
-        f"Univers gem ($1M–$100M) : {universe_size} | candidats : {candidates_total} | "
+        f"Univers gem{window_label} : {universe_size} | candidats : {candidates_total} | "
         f"highlights : {min(highlight_top_n, len(candidates))}\n"
         f"📎 CSV joint = liste complète triée par score."
     )
@@ -181,6 +185,110 @@ def format_digest(
             lines.append(f"    {t.chart_url}")
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+def build_accumulation_digest(
+    candidates: list,  # list[AccumulationCandidate]
+    universe_size: int,
+    highlight_top_n: int = 10,
+) -> str:
+    """Header for the on-chain accumulation digest (parallel to trend)."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    header = (
+        f"🕵️ Quietly accumulated — {now}\n"
+        f"Univers gem : {universe_size} | candidats accumulation : {len(candidates)} | "
+        f"highlights : {min(highlight_top_n, len(candidates))}\n"
+        f"📎 CSV joint = liste complète triée par score d'accumulation."
+    )
+    if not candidates:
+        return header + "\n\n_Aucun signal d'accumulation aujourd'hui._"
+
+    lines = [header, ""]
+    for i, c in enumerate(candidates[:highlight_top_n], start=1):
+        t = c.token
+        m = c.metrics
+        f = c.factors
+        symbol = _md_escape(t.symbol or "?")
+        chain_label = (t.chain or "?").upper()
+        lines.append(
+            f"#{i}  {symbol}  ({chain_label}, age {_fmt_age(t.age_days)})  "
+            f"acc {c.score:.2f}"
+        )
+        lines.append(
+            f"    mcap {_fmt_money(t.mcap_usd)}  vol24h {_fmt_money(t.vol_24h_usd)}"
+        )
+        bits = [
+            f"wyckoff {f.get('wyckoff', 0):.2f}",
+            f"holders {f.get('holder_growth', 0):.2f}",
+            f"distrib {f.get('distribution', 0):.2f}",
+            f"buyers {f.get('buy_pressure', 0):.2f}",
+        ]
+        lines.append("    " + "  ".join(bits))
+        sub = []
+        hg = m.get("holder_growth_14d")
+        if hg is not None:
+            sub.append(f"Δholders {_fmt_pct(hg)}")
+        tg = m.get("tvl_growth_14d")
+        if tg is not None:
+            sub.append(f"ΔTVL {_fmt_pct(tg)}")
+        top20 = m.get("top20_share")
+        if top20 is not None:
+            sub.append(f"top20 {top20 * 100:.0f}%")
+        td = m.get("top20_delta")
+        if td is not None:
+            sub.append(f"Δtop20 {td * 100:+.1f}pp")
+        hist = m.get("snapshot_history_days")
+        if hist is not None:
+            sub.append(f"hist {hist}j")
+        if sub:
+            lines.append("    " + "  ".join(sub))
+        if t.chart_url:
+            lines.append(f"    {t.chart_url}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+ACC_CSV_COLUMNS = [
+    "rank", "symbol", "name", "chain", "address", "score",
+    "mcap_usd", "vol_24h_usd", "age_days",
+    "factor_wyckoff", "factor_holder_growth", "factor_distribution",
+    "factor_tvl_growth", "factor_buy_pressure",
+    "holder_growth_14d", "tvl_growth_14d", "top20_share", "top20_delta",
+    "snapshot_history_days", "chart_url",
+]
+
+
+def build_accumulation_csv(candidates: list) -> bytes:
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=ACC_CSV_COLUMNS)
+    w.writeheader()
+    for i, c in enumerate(candidates, start=1):
+        t = c.token
+        m = c.metrics
+        f = c.factors
+        w.writerow({
+            "rank": i,
+            "symbol": t.symbol,
+            "name": t.name,
+            "chain": t.chain or "",
+            "address": t.address or "",
+            "score": round(c.score, 4),
+            "mcap_usd": t.mcap_usd or "",
+            "vol_24h_usd": t.vol_24h_usd or "",
+            "age_days": int(t.age_days) if t.age_days is not None else "",
+            "factor_wyckoff":       round(f.get("wyckoff", 0), 3),
+            "factor_holder_growth": round(f.get("holder_growth", 0), 3),
+            "factor_distribution":  round(f.get("distribution", 0), 3),
+            "factor_tvl_growth":    round(f.get("tvl_growth", 0), 3),
+            "factor_buy_pressure":  round(f.get("buy_pressure", 0), 3),
+            "holder_growth_14d": _round(m.get("holder_growth_14d")),
+            "tvl_growth_14d":    _round(m.get("tvl_growth_14d")),
+            "top20_share":       _round(m.get("top20_share")),
+            "top20_delta":       _round(m.get("top20_delta")),
+            "snapshot_history_days": m.get("snapshot_history_days") or "",
+            "chart_url": t.chart_url or "",
+        })
+    return buf.getvalue().encode("utf-8")
 
 
 CSV_COLUMNS = [
