@@ -25,19 +25,20 @@ class Settings(BaseSettings):
 
     mcap_min_usd: float = Field(default=1_000_000, alias="SCANNER_MCAP_MIN_USD")
     mcap_max_usd: float = Field(default=100_000_000, alias="SCANNER_MCAP_MAX_USD")
-    min_age_days: int = Field(default=5, alias="SCANNER_MIN_AGE_DAYS")
+    min_age_days: int = Field(default=14, alias="SCANNER_MIN_AGE_DAYS")
     min_vol_mcap_ratio: float = Field(default=0.05, alias="SCANNER_MIN_VOL_MCAP_RATIO")
     min_vol_24h_usd: float = Field(default=100_000, alias="SCANNER_MIN_VOL_24H_USD")
 
-    score_threshold: float = Field(default=0.60, alias="SCANNER_SCORE_THRESHOLD")
-    watchlist_threshold: float = Field(default=0.45, alias="SCANNER_WATCHLIST_THRESHOLD")
-    top_n: int = Field(default=15, alias="SCANNER_TOP_N")
+    score_threshold: float = Field(default=0.55, alias="SCANNER_SCORE_THRESHOLD")
+    watchlist_threshold: float = Field(default=0.40, alias="SCANNER_WATCHLIST_THRESHOLD")
     chart_top_n: int = Field(default=5, alias="SCANNER_CHART_TOP_N")
+    highlight_top_n: int = Field(default=10, alias="SCANNER_HIGHLIGHT_TOP_N")
     realert_cooldown_days: int = Field(default=5, alias="SCANNER_REALERT_COOLDOWN_DAYS")
     reject_wash_trade: bool = Field(default=True, alias="SCANNER_REJECT_WASH_TRADE")
-    full_scan_hours_csv: str = Field(default="0,6,12,18", alias="SCANNER_FULL_SCAN_HOURS")
+    full_scan_hours_csv: str = Field(default="1", alias="SCANNER_FULL_SCAN_HOURS")
     full_scan_minute: int = Field(default=30, alias="SCANNER_FULL_SCAN_MINUTE")
-    watchlist_scan_minutes: int = Field(default=60, alias="SCANNER_WATCHLIST_SCAN_MINUTES")
+    watchlist_scan_minutes: int = Field(default=240, alias="SCANNER_WATCHLIST_SCAN_MINUTES")
+    ohlcv_days: int = Field(default=365, alias="SCANNER_OHLCV_DAYS")
 
     networks_csv: str = Field(default="solana,eth,base,arbitrum,bsc", alias="SCANNER_NETWORKS")
 

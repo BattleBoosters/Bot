@@ -1,12 +1,13 @@
-"""CLI entrypoint for the gem momentum scanner.
+"""CLI entrypoint for the gem long-term uptrend scanner.
 
 Commands:
     config-check    Verify .env and ping Telegram.
     scan-once       Run one full scan (universe → score → alert).
     watchlist-scan  Run one watchlist delta scan (forced fresh OHLCV, alert
                     only on tokens crossing the score threshold).
-    run             Long-running daemon: 4 full scans/day plus an hourly
-                    watchlist delta scan.
+    run             Long-running daemon: scheduled full scans (default 1×/day
+                    at 01:30 UTC) plus periodic watchlist delta scans
+                    (default every 240 min).
 """
 
 from __future__ import annotations
@@ -21,9 +22,11 @@ import httpx
 import typer
 
 from scanner.alerts import (
+    build_csv,
     format_card,
     format_digest,
     ping_telegram,
+    send_document,
     send_message,
     send_photo,
 )
@@ -125,19 +128,20 @@ async def _score_candidates(
     listed_toks = [t for t in candidates if t.coingecko_id and not (t.chain and t.pool_address)]
 
     cache_age = 0.0 if force_fresh else 6.0
+    days = settings.ohlcv_days
     chain_ohlcv = await fetch_many(
-        srcs.gt, chain_toks, days=30, cache_dir=settings.cache_dir, concurrency=3,
+        srcs.gt, chain_toks, days=days, cache_dir=settings.cache_dir, concurrency=3,
         cache_max_age_hours=cache_age,
     )
     listed_ohlcv = await fetch_many(
-        srcs.cg, listed_toks, days=30, cache_dir=settings.cache_dir, concurrency=2,
+        srcs.cg, listed_toks, days=days, cache_dir=settings.cache_dir, concurrency=2,
         cache_max_age_hours=cache_age,
     )
     ohlcv = {**chain_ohlcv, **listed_ohlcv}
 
     btc_token = Token(symbol="BTC", coingecko_id="bitcoin", source="coingecko")
     btc_df = await get_ohlcv_cached(
-        srcs.cg, btc_token, days=30, cache_dir=settings.cache_dir,
+        srcs.cg, btc_token, days=days, cache_dir=settings.cache_dir,
         cache_max_age_hours=cache_age,
     )
 
@@ -162,9 +166,12 @@ async def _send_alerts(
     state: AlertState,
     dry_run: bool,
     stats: ScanStats,
+    csv_filename: str = "gems.csv",
 ) -> bool:
     if dry_run:
         print(digest)
+        if fresh:
+            print(f"\n[csv would be attached: {len(fresh)} rows]")
         return True
 
     if not settings.telegram_configured():
@@ -200,6 +207,15 @@ async def _send_alerts(
         )
 
     if fresh:
+        csv_bytes = build_csv(fresh)
+        await send_document(
+            client,
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            csv_bytes,
+            filename=csv_filename,
+            caption=f"{len(fresh)} candidats triés par score (CSV).",
+        )
         for c in fresh:
             await state.mark_alerted(c.token.key, c.token.symbol, c.score)
         stats.alerts_sent = len(fresh)
@@ -252,12 +268,13 @@ async def run_full_scan(settings: Settings, dry_run: bool = False) -> int:
             s for s in scored if s.rejection is None and s.score >= settings.score_threshold
         ]
         stats.candidates_qualified = len(qualified)
-        ranked = rank_candidates(scored, settings.score_threshold, settings.top_n)
+        # Send everything that clears the score threshold — no top_n cap.
+        ranked = rank_candidates(scored, settings.score_threshold, top_n=None)
 
         state = AlertState(settings.db_path)
         await state.init()
 
-        # Refresh watchlist with all tokens scoring above the watchlist threshold,
+        # Refresh watchlist with tokens scoring above the watchlist threshold,
         # whether or not they made the alert cut.
         for s in scored:
             if s.rejection is None and s.score >= settings.watchlist_threshold:
@@ -280,11 +297,13 @@ async def run_full_scan(settings: Settings, dry_run: bool = False) -> int:
             fresh,
             universe_size=ustats.deduped,
             candidates_total=len(qualified),
-            top_n=settings.top_n,
+            highlight_top_n=settings.highlight_top_n,
         )
 
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
         ok = await _send_alerts(
-            client, settings, fresh, ohlcv, digest, state, dry_run, stats
+            client, settings, fresh, ohlcv, digest, state, dry_run, stats,
+            csv_filename=f"gems_{ts}.csv",
         )
 
     logger.info("[full] %s", stats.finish().summary_line())
@@ -316,7 +335,7 @@ async def run_watchlist_scan(settings: Settings, dry_run: bool = False) -> int:
             s for s in scored if s.rejection is None and s.score >= settings.score_threshold
         ]
         stats.candidates_qualified = len(qualified)
-        ranked = rank_candidates(scored, settings.score_threshold, settings.top_n)
+        ranked = rank_candidates(scored, settings.score_threshold, top_n=None)
 
         fresh: list[ScoredCandidate] = []
         for c in ranked:
@@ -339,11 +358,13 @@ async def run_watchlist_scan(settings: Settings, dry_run: bool = False) -> int:
             fresh,
             universe_size=len(watchlist),
             candidates_total=len(qualified),
-            top_n=settings.top_n,
+            highlight_top_n=settings.highlight_top_n,
         )
 
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
         ok = await _send_alerts(
-            client, settings, fresh, ohlcv, digest, state, dry_run, stats
+            client, settings, fresh, ohlcv, digest, state, dry_run, stats,
+            csv_filename=f"watchlist_{ts}.csv",
         )
 
     logger.info("[wl] %s", stats.finish().summary_line())
@@ -407,7 +428,8 @@ async def _config_check(settings: Settings) -> int:
     print(f"vol/mcap min:  {settings.min_vol_mcap_ratio:.2%}")
     print(f"vol24h min:    ${settings.min_vol_24h_usd:,.0f}")
     print(f"score thresh:  {settings.score_threshold}  (watchlist {settings.watchlist_threshold})")
-    print(f"top N:         {settings.top_n}  (charts: top {settings.chart_top_n})")
+    print(f"highlights:    top {settings.highlight_top_n}  (charts: top {settings.chart_top_n})")
+    print(f"OHLCV window:  {settings.ohlcv_days} days")
     print(f"reject wash:   {settings.reject_wash_trade}")
     print(f"networks:      {settings.networks}")
     print(f"full scans:    {settings.full_scan_hours} at :{settings.full_scan_minute:02d} UTC")
@@ -469,7 +491,7 @@ def watchlist_scan_cmd(
 
 @app.command("run")
 def run_cmd() -> None:
-    """Run as a long-lived daemon: full scans 4×/day plus hourly watchlist."""
+    """Run as a long-lived daemon: scheduled full scans + watchlist deltas."""
     settings = get_settings()
     try:
         code = asyncio.run(run_daemon(settings))

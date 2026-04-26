@@ -77,6 +77,75 @@ def median_volume(volume: pd.Series, window: int) -> float | None:
     return float(val)
 
 
+def log_slope_per_day(close: pd.Series, min_points: int = 14) -> float | None:
+    """Linear regression slope of log(close) vs time index, in 'log-units per day'.
+
+    A slope of ln(2)/30 ≈ 0.0231 means the series doubles every 30 days. The
+    annualised growth rate equals exp(slope * 365) - 1, used by the scoring
+    layer as a horizon-agnostic 'how steep is the all-time uptrend' signal.
+    """
+    s = close.dropna()
+    if len(s) < min_points:
+        return None
+    s = s[s > 0]
+    if len(s) < min_points:
+        return None
+    y = np.log(s.to_numpy(dtype=float))
+    x = np.arange(len(y), dtype=float)
+    x_mean = x.mean()
+    y_mean = y.mean()
+    num = float(((x - x_mean) * (y - y_mean)).sum())
+    den = float(((x - x_mean) ** 2).sum())
+    if den <= 0:
+        return None
+    return num / den
+
+
+def annualised_from_log_slope(slope_per_day: float | None) -> float | None:
+    if slope_per_day is None:
+        return None
+    return float(np.exp(slope_per_day * 365.0) - 1.0)
+
+
+def drawdown_from_ath(close: pd.Series) -> float | None:
+    """Current drawdown from rolling all-time high in the provided series.
+
+    Returns a negative number (or 0.0 at the high). E.g. -0.18 = 18% below
+    the highest close seen in the window.
+    """
+    s = close.dropna()
+    if s.empty:
+        return None
+    high = float(s.max())
+    last = float(s.iloc[-1])
+    if high <= 0:
+        return None
+    return last / high - 1.0
+
+
+def weeks_up_ratio(close: pd.Series, n_weeks: int = 12) -> float | None:
+    """Fraction of the last `n_weeks` calendar weeks that closed positive.
+
+    Resamples the daily series to weekly closes (W-SUN), takes the last
+    `n_weeks + 1` weekly closes, returns up_weeks / n_weeks. None if
+    insufficient history.
+    """
+    s = close.dropna()
+    if s.empty:
+        return None
+    if not isinstance(s.index, pd.DatetimeIndex):
+        try:
+            s = s.copy()
+            s.index = pd.to_datetime(s.index)
+        except Exception:
+            return None
+    weekly = s.resample("W-SUN").last().dropna()
+    if len(weekly) < n_weeks + 1:
+        return None
+    diffs = weekly.iloc[-n_weeks - 1:].diff().iloc[1:]
+    return float((diffs > 0).sum() / n_weeks)
+
+
 def clip01(x: float) -> float:
     if x != x:  # NaN
         return 0.0
