@@ -1,0 +1,37 @@
+[project]
+name = "crypto-momentum-scanner"
+version = "0.1.0"
+description = "Scan small-cap crypto gems ($1M-$100M mcap) for sustained momentum and alert on Telegram"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx[http2]>=0.27",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "typer>=0.12",
+    "tenacity>=8.5",
+    "aiosqlite>=0.20",
+    "pyarrow>=16",
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+scanner = "scanner.main:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["scanner*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
