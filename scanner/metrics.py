@@ -30,9 +30,14 @@ class ScanStats:
     ohlcv_misses: int = 0
     watchlist_size: int = 0
 
+    score_rejections: dict[str, int] = field(default_factory=dict)
+
     accumulation_scored: int = 0
     accumulation_qualified: int = 0
     accumulation_alerts: int = 0
+
+    def bump_rejection(self, reason: str) -> None:
+        self.score_rejections[reason] = self.score_rejections.get(reason, 0) + 1
 
     def finish(self) -> Self:
         self.finished_at = perf_counter()

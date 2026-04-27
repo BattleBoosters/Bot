@@ -52,15 +52,29 @@ class ScoredCandidate:
     rejection: str | None = None
 
 
-def _trend_gate(close: pd.Series) -> bool:
-    if len(close) < 50:
-        return False
-    ma20 = ma(close, 20)
-    ma50 = ma(close, 50)
+def _trend_gate_status(close: pd.Series) -> str:
+    """Returns one of:
+      - "ok"                 : MA50 + MA20 + last all aligned bullish
+      - "ok_short"           : 30 ≤ history < 50; only MA20 confirmed
+      - "insufficient_history": < 30 daily bars (MA20 not even reliable)
+      - "trend_gate"         : enough history but MAs not aligned
+    """
+    n = len(close)
+    if n < 30:
+        return "insufficient_history"
     last = float(close.iloc[-1])
-    if ma20 is None or ma50 is None:
-        return False
-    return last > ma20 > ma50
+    ma20 = ma(close, 20)
+    if ma20 is None:
+        return "insufficient_history"
+    if n < 50:
+        # Short-history pools: accept MA20 alone when the last close
+        # is comfortably above it. Better than rejecting fresh DEX
+        # listings that haven't accumulated 50 bars yet.
+        return "ok_short" if last > ma20 else "trend_gate"
+    ma50 = ma(close, 50)
+    if ma50 is None:
+        return "trend_gate"
+    return "ok" if last > ma20 > ma50 else "trend_gate"
 
 
 # Sanity-guard thresholds: anything beyond these is almost always bad data
@@ -176,8 +190,9 @@ def score_token(
     close = ohlcv["close"].astype(float)
     volume = ohlcv["volume"].astype(float) if "volume" in ohlcv.columns else pd.Series(dtype=float)
 
-    if not _trend_gate(close):
-        return ScoredCandidate(token=token, score=0.0, rejection="trend_gate")
+    gate_status = _trend_gate_status(close)
+    if gate_status in {"trend_gate", "insufficient_history"}:
+        return ScoredCandidate(token=token, score=0.0, rejection=gate_status)
 
     p7 = perf(close, 7)
     p14 = perf(close, 14)

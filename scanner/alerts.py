@@ -126,12 +126,15 @@ def format_digest(
     candidates_total: int,
     highlight_top_n: int = 10,
     mcap_window_str: str = "",
+    funnel: dict | None = None,
 ) -> str:
     """Header message: summary line + detailed top-N highlights.
 
     Full list goes out as a CSV attachment, see `build_csv`. The mcap
     window string is rendered into the summary line so the digest reflects
-    the actual run config rather than a hard-coded range.
+    the actual run config rather than a hard-coded range. The optional
+    `funnel` dict is rendered as a diagnostic line so an operator
+    immediately sees where candidates die when `candidates_total == 0`.
     """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     window_label = f" {mcap_window_str}" if mcap_window_str else ""
@@ -141,6 +144,8 @@ def format_digest(
         f"highlights : {min(highlight_top_n, len(candidates))}\n"
         f"📎 CSV joint = liste complète triée par score."
     )
+    if funnel:
+        header += "\n" + _render_funnel(funnel)
     if not candidates:
         return header + "\n\n_Aucun candidat ne passe le seuil aujourd'hui._"
 
@@ -185,6 +190,36 @@ def format_digest(
             lines.append(f"    {t.chart_url}")
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+def _render_funnel(f: dict) -> str:
+    """Compact ascii funnel: where candidates die at each stage."""
+    raw = f.get("raw", 0)
+    deduped = f.get("deduped", 0)
+    passed = f.get("passed_filters", 0)
+    scored = f.get("scored", 0)
+    qualified = f.get("qualified", 0)
+    rejs = f.get("rejections") or {}
+
+    line1 = (
+        f"🔍 Funnel: raw {raw} → deduped {deduped} → filtres {passed} → "
+        f"scored {scored} → qualified {qualified}"
+    )
+    if not rejs:
+        return line1
+    # Sort rejections by frequency, keep most informative first.
+    pretty_keys = {
+        "no_ohlcv":              "no_ohlcv",
+        "insufficient_history":  "history<30d",
+        "trend_gate":            "trend_gate (MAs KO)",
+        "perf_artifact":         "perf>+500% (data)",
+        "price_floor_artifact":  "price~0 (data)",
+        "data_gap":              "gap>50× (data)",
+        "score_below_threshold": "score<seuil",
+    }
+    items = sorted(rejs.items(), key=lambda kv: -kv[1])
+    bits = [f"{pretty_keys.get(k, k)} {v}" for k, v in items if v > 0]
+    return line1 + "\n   " + "  ·  ".join(bits)
 
 
 def build_accumulation_digest(

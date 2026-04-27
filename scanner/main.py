@@ -253,9 +253,14 @@ async def _score_candidates(
         df = ohlcv.get(tok.key)
         if df is None or df.empty:
             stats.ohlcv_misses += 1
+            stats.bump_rejection("no_ohlcv")
             continue
         sc = score_token(tok, df, btc_df, include_post_peak=settings.include_post_peak)
         scored.append(sc)
+        if sc.rejection is not None:
+            stats.bump_rejection(sc.rejection)
+        elif sc.score < settings.score_threshold:
+            stats.bump_rejection("score_below_threshold")
     stats.candidates_scored = len(scored)
     return scored, ohlcv, btc_df
 
@@ -472,6 +477,14 @@ async def run_full_scan(settings: Settings, dry_run: bool = False) -> int:
             candidates_total=len(qualified),
             highlight_top_n=settings.highlight_top_n,
             mcap_window_str=settings.mcap_window_str,
+            funnel={
+                "raw":              stats.universe_raw,
+                "deduped":          stats.universe_deduped,
+                "passed_filters":   stats.universe_passed,
+                "scored":           stats.candidates_scored,
+                "qualified":        stats.candidates_qualified,
+                "rejections":       stats.score_rejections,
+            },
         )
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
