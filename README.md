@@ -113,6 +113,8 @@ All thresholds live in `.env` and override the defaults in `scanner/config.py`:
 | `SCANNER_CHART_TOP_N` | 5 | How many top candidates get a chart PNG attached |
 | `SCANNER_OHLCV_DAYS` | 365 | OHLCV history window pulled per token |
 | `SCANNER_NETWORKS` | solana,eth,base,arbitrum,bsc | DEX chains scanned |
+| `SCANNER_GT_TOP_POOLS_PAGES` | 5 | GT pages of top-by-volume pools per chain (~100 pools/page) |
+| `SCANNER_INCLUDE_POST_PEAK` | false | When true, tokens up to -50% from ATH still pass proximity (catches second-leg setups) |
 | `SCANNER_REALERT_COOLDOWN_DAYS` | 5 | Days before re-alerting |
 | `SCANNER_REJECT_WASH_TRADE` | true | Drop tokens whose tx pattern looks washed |
 | `SCANNER_FULL_SCAN_HOURS` | 1 | UTC hours for daemon full scans (CSV) |

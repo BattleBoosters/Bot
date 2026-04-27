@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     onchain_concurrency: int = Field(default=4, alias="SCANNER_ONCHAIN_CONCURRENCY")
     onchain_max_tokens: int = Field(default=200, alias="SCANNER_ONCHAIN_MAX_TOKENS")
 
+    # Universe / scoring tuning
+    gt_top_pools_pages: int = Field(default=5, alias="SCANNER_GT_TOP_POOLS_PAGES")
+    include_post_peak: bool = Field(default=False, alias="SCANNER_INCLUDE_POST_PEAK")
+
     request_timeout_seconds: float = Field(default=30.0, alias="SCANNER_HTTP_TIMEOUT")
 
     @property

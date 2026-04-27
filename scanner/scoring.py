@@ -63,22 +63,67 @@ def _trend_gate(close: pd.Series) -> bool:
     return last > ma20 > ma50
 
 
+# Sanity-guard thresholds: anything beyond these is almost always bad data
+# (pool migration, decimal mismatch, near-zero genesis price), not a real
+# opportunity.
+MAX_PERF_30D = 5.0       # > +500% in 30 days
+MAX_PERF_90D = 20.0      # > +2000% in 90 days
+MIN_PRICE_FLOOR = 1e-10  # any candle close below this is dust-data
+MAX_BAR_GAP_RATIO = 50.0 # consecutive close ratio > 50× is a data gap
+
+
+def _data_artifact_reason(
+    close: pd.Series, p30: float | None, p90: float | None
+) -> str | None:
+    """Detect garbage OHLCV that would generate astronomical scores.
+
+    Returns a rejection-reason string when the data looks like an
+    artifact, otherwise None. We hard-reject because no legitimate gem
+    moves >500%/30d on a clean chart — when we see it, the early bars
+    are essentially zero and the perf math explodes.
+    """
+    if p30 is not None and p30 > MAX_PERF_30D:
+        return "perf_artifact"
+    if p90 is not None and p90 > MAX_PERF_90D:
+        return "perf_artifact"
+    s = close.dropna()
+    if not s.empty and float(s.min()) < MIN_PRICE_FLOOR:
+        return "price_floor_artifact"
+    if len(s) >= 2:
+        ratio = (s / s.shift(1)).dropna()
+        if not ratio.empty:
+            r_max = float(ratio.max())
+            r_min = float(ratio.min())
+            if r_max > MAX_BAR_GAP_RATIO or (r_min > 0 and 1.0 / r_min > MAX_BAR_GAP_RATIO):
+                return "data_gap"
+    return None
+
+
 def _factor_slope(annualised: float | None) -> float:
     """Annualised growth rate from log-regression slope.
 
     +50%/yr → 0, +350%/yr → 1. A token doubling every 6 months
-    (≈ +300%/yr) sits comfortably near the top of the scale.
+    (≈ +300%/yr) sits comfortably near the top of the scale. Any value
+    above 3.5 saturates at 1, so even if a residual artifact slips
+    through (e.g. a 10× slope) the score doesn't blow up.
     """
     if annualised is None:
         return 0.0
     return linmap(annualised, 0.50, 3.50)
 
 
-def _factor_ath_proximity(dd: float | None) -> float:
-    """1.0 at the all-time high, 0.0 at -25% drawdown or worse."""
+def _factor_ath_proximity(dd: float | None, include_post_peak: bool = False) -> float:
+    """1.0 at the all-time high, 0.0 at the cutoff drawdown.
+
+    Default cutoff = -25% (strict: only "near ATH" qualifies). When
+    `include_post_peak` is True the cutoff softens to -50% so tokens
+    that already had a major move and are now consolidating still
+    surface — useful for second-leg plays. The trade-off: more noise.
+    """
     if dd is None:
         return 0.0
-    return clip01(1.0 + dd / 0.25)
+    cutoff = 0.50 if include_post_peak else 0.25
+    return clip01(1.0 + dd / cutoff)
 
 
 def _factor_perf_consist(p7: float | None, p14: float | None, p30: float | None) -> float:
@@ -120,7 +165,10 @@ def _factor_rsi(value: float | None) -> float:
 
 
 def score_token(
-    token: Token, ohlcv: pd.DataFrame, btc_ohlcv: pd.DataFrame | None
+    token: Token,
+    ohlcv: pd.DataFrame,
+    btc_ohlcv: pd.DataFrame | None,
+    include_post_peak: bool = False,
 ) -> ScoredCandidate:
     if ohlcv is None or ohlcv.empty or "close" not in ohlcv.columns:
         return ScoredCandidate(token=token, score=0.0, rejection="no_ohlcv")
@@ -136,6 +184,11 @@ def score_token(
     p30 = perf(close, 30)
     p60 = perf(close, 60)
     p90 = perf(close, 90)
+
+    artifact = _data_artifact_reason(close, p30, p90)
+    if artifact is not None:
+        return ScoredCandidate(token=token, score=0.0, rejection=artifact)
+
     rsi_val = rsi(close, 14)
     slope_d = log_slope_per_day(close, min_points=20)
     annualised = annualised_from_log_slope(slope_d)
@@ -148,7 +201,7 @@ def score_token(
 
     factors = {
         "slope":         _factor_slope(annualised),
-        "ath_proximity": _factor_ath_proximity(dd),
+        "ath_proximity": _factor_ath_proximity(dd, include_post_peak=include_post_peak),
         "perf_consist":  _factor_perf_consist(p7, p14, p30),
         "volume":        _factor_volume(volume) if not volume.empty else 0.0,
         "rs_btc":        _factor_rs_btc(p30, btc_p30),

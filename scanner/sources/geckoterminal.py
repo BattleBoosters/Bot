@@ -103,9 +103,11 @@ class GeckoTerminalSource:
         networks: list[str],
         client: httpx.AsyncClient,
         rate_limit_per_min: int = 25,
+        top_pools_pages: int = 5,
     ):
         self.networks = networks
         self.client = client
+        self.top_pools_pages = max(1, int(top_pools_pages))
         self._sem = asyncio.Semaphore(2)
         self._min_interval = 60.0 / max(rate_limit_per_min, 1)
         self._last_call = 0.0
@@ -140,10 +142,20 @@ class GeckoTerminalSource:
 
     async def list_universe(self) -> list[Token]:
         tokens: dict[str, Token] = {}
+        # Three discovery streams per chain:
+        #   trending_pools  — currently buzzing
+        #   new_pools       — freshly created, the early-stage candidates
+        #   pools (top by 24h volume) — the broad mid-tier we used to miss
+        # We paginate `pools` more aggressively because that's where most
+        # established gems live (rank 50–500 by volume per chain).
         for network in self.networks:
-            for endpoint in ("trending_pools", "new_pools"):
+            for endpoint, pages in (
+                ("trending_pools", (1, 2)),
+                ("new_pools",      (1, 2)),
+                ("pools",          tuple(range(1, self.top_pools_pages + 1))),
+            ):
                 try:
-                    for page in (1, 2):
+                    for page in pages:
                         data = await self._get(
                             f"/networks/{network}/{endpoint}",
                             params={"page": page, "include": "base_token,quote_token"},
@@ -152,7 +164,10 @@ class GeckoTerminalSource:
                             (item["type"], item["id"]): item
                             for item in data.get("included", [])
                         }
-                        for pool in data.get("data", []):
+                        rows = data.get("data", []) or []
+                        if not rows:
+                            break
+                        for pool in rows:
                             tok = self._pool_to_token(pool, included, network)
                             if tok and tok.key not in tokens:
                                 tokens[tok.key] = tok

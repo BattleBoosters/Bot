@@ -77,7 +77,11 @@ def _make_client(settings: Settings) -> httpx.AsyncClient:
 
 def _build_sources(settings: Settings, client: httpx.AsyncClient) -> Sources:
     return Sources(
-        gt=GeckoTerminalSource(networks=settings.networks, client=client),
+        gt=GeckoTerminalSource(
+            networks=settings.networks,
+            client=client,
+            top_pools_pages=settings.gt_top_pools_pages,
+        ),
         ds=DexscreenerSource(client=client),
         cg=CoinGeckoSource(
             client=client,
@@ -250,7 +254,7 @@ async def _score_candidates(
         if df is None or df.empty:
             stats.ohlcv_misses += 1
             continue
-        sc = score_token(tok, df, btc_df)
+        sc = score_token(tok, df, btc_df, include_post_peak=settings.include_post_peak)
         scored.append(sc)
     stats.candidates_scored = len(scored)
     return scored, ohlcv, btc_df

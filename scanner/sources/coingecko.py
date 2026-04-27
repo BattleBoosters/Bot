@@ -100,9 +100,13 @@ class CoinGeckoSource:
 
     async def list_universe(self) -> list[Token]:
         tokens: list[Token] = []
+        consecutive_errors = 0
         # Walk pages ascending by mcap until we exceed mcap_max. Cap at 40
         # pages (10k tokens) to keep one full scan within ~2 minutes on the
-        # free tier even when mcap_max is bumped to $300M+.
+        # free tier even when mcap_max is bumped to $300M+. We do NOT bail
+        # on the first transient error — rate-limit hiccups and 5xx are
+        # routine on the CG free tier and the previous behaviour silently
+        # truncated the universe to ~80 tokens on the first 429.
         for page in range(1, 41):
             try:
                 rows = await self._get(
@@ -116,9 +120,25 @@ class CoinGeckoSource:
                         "price_change_percentage": "24h,7d",
                     },
                 )
+                consecutive_errors = 0
             except httpx.HTTPError as e:
-                logger.warning("coingecko markets page %d failed: %s", page, e)
-                break
+                consecutive_errors += 1
+                logger.warning(
+                    "coingecko markets page %d failed (%d/3): %s",
+                    page, consecutive_errors, e,
+                )
+                # Three consecutive failures usually means the upstream is
+                # down or the API key is bad. Bail rather than waste 30+
+                # more retries.
+                if consecutive_errors >= 3:
+                    logger.error(
+                        "coingecko markets paging aborted after 3 failures"
+                    )
+                    break
+                # Otherwise wait and try the NEXT page (this one may be a
+                # one-off; the worst case is we miss a 250-row slice).
+                await asyncio.sleep(8 * consecutive_errors)
+                continue
             if not isinstance(rows, list) or not rows:
                 break
             stop_paging = False
